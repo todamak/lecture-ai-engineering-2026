@@ -57,6 +57,14 @@ uv run python -m app.ask "AIE2026の講座で使う「lecNN-start タグ」と�
 uv run python -m app.ask "AIE2026の第2回では何を学びますか？"
 ```
 
+会話履歴を保って続けて質問するには、対話モードを使います。`exit` または `quit` で終了します。各回答の応答時間とトークン数も表示されます。
+
+```bash
+uv run python -m app.ask --interactive
+# 最初の質問を引数で渡して始めることもできます
+uv run python -m app.ask --interactive "LoRAとは何ですか？"
+```
+
 ### 6. Copilot でトークン数を表示させる
 
 `app/ask.py` の `TODO(第1回 演習)` の場所で、入力トークン数と出力トークン数を表示するよう改修します。Copilot の補完やチャットを使ってかまいません。提案されたコードは、読んで理解してから採用してください。
