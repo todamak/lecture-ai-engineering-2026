@@ -124,18 +124,109 @@ def open_index(path: Path):
         db.close()
 
 
+
 def search(query: str) -> list[dict]:
-    """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
+    """質問を埋め込み、近いページと前後1ページの本文を重複なく返す。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
+
+    # 資料全体のページ情報を取得する。
+    pages = load_pages(RAG_SOURCE)
+
+    # 資料ごとにページをまとめ、PDFページ番号順に並べる。
+    # 別資料のページが混ざらないようにする。
+    pages_by_document = defaultdict(list)
+
+    for page in pages:
+        pages_by_document[page["document_id"]].append(page)
+
+    for document_pages in pages_by_document.values():
+        document_pages.sort(key=lambda p: p["page"])
+
+    # ページIDからページ情報を取得できるようにする。
+    page_positions = {}
+
+    for document_id, document_pages in pages_by_document.items():
+        for index, page in enumerate(document_pages):
+            page_positions[page["page_id"]] = (
+                document_id,
+                index,
+            )
+
     with open_index(RAG_DB) as db:
         vector = embed_text(query.strip(), "RETRIEVAL_QUERY")
+
         rows = db.execute("""
-            SELECT page_id, document_id, lecture, document_title, section, title, page, content,
+            SELECT page_id, document_id, lecture, document_title,
+                   section, title, page, content,
                    vec_distance_cosine(embedding, ?) AS distance
-            FROM chunks ORDER BY distance, page_id LIMIT ?
-        """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
-        return [dict(row) for row in rows]
+            FROM chunks
+            ORDER BY distance, page_id
+            LIMIT ?
+        """, (
+            sqlite_vec.serialize_float32(vector),
+            RAG_TOP_K,
+        )).fetchall()
+
+    # ベクトル検索でヒットしたページ。
+    hits = [dict(row) for row in rows]
+
+    # 検索結果自身のページID。
+    hit_ids = {hit["page_id"] for hit in hits}
+
+    # すでに補足ページとして追加したページID。
+    # 複数の検索結果から同じページが追加されるのを防ぐ。
+    included_context_ids = set()
+
+    results = []
+
+    for hit in hits:
+        document_id = hit["document_id"]
+        page_id = hit["page_id"]
+
+        context_pages = []
+
+        # ページの所属資料と、その資料内での位置を取得。
+        position = page_positions.get(page_id)
+
+        if position is not None:
+            _, index = position
+            document_pages = pages_by_document[document_id]
+
+            # 前後1ページを確認する。
+            for offset, relation in (
+                (-1, "previous"),
+                (1, "next"),
+            ):
+                neighbor_index = index + offset
+
+                # 資料の先頭・末尾を越えないようにする。
+                if not 0 <= neighbor_index < len(document_pages):
+                    continue
+
+                neighbor = document_pages[neighbor_index]
+                neighbor_id = neighbor["page_id"]
+
+                # 検索結果自身や、すでに追加したページは除外。
+                if neighbor_id in hit_ids:
+                    continue
+
+                if neighbor_id in included_context_ids:
+                    continue
+
+                included_context_ids.add(neighbor_id)
+
+                context_pages.append({
+                    **neighbor,
+                    "relation": relation,
+                })
+
+        results.append({
+            **hit,
+            "context_pages": context_pages,
+        })
+
+    return results
 
 
 def search_graph(query: str) -> dict:
@@ -198,14 +289,37 @@ def run_full_context(agent, question: str, model, instructions: str, prompt_temp
         raise SystemExit(1)
 
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="エージェントを使わず、講義資料の検索だけを実行する")
+    parser = argparse.ArgumentParser(
+        description="エージェントを使わず、講義資料の検索だけを実行する"
+    )
     parser.add_argument("query", help="調べたい内容")
     args = parser.parse_args()
+
     for i, result in enumerate(search(args.query), 1):
-        print(f"\n{'=' * 60}\n検索結果 {i}\n{'=' * 60}")
+        print(f"\n{'=' * 60}")
+        print(f"検索結果 {i}")
+        print(f"{'=' * 60}")
+
         print(f"講義: {result['document_title']}")
         print(f"章: {result['section']}")
         print(f"タイトル: {result['title']}")
         print(f"ページ: {result['page']}")
-        print(f"\n{result['content']}")
+        print(f"距離: {result['distance']:.4f}")
+
+        print("\n【検索ヒットページ】")
+        print(result["content"])
+
+        for context in result["context_pages"]:
+            if context["relation"] == "previous":
+                label = "前のページ"
+            else:
+                label = "次のページ"
+
+            print(f"\n--- {label} ---")
+            print(f"講義: {context['document_title']}")
+            print(f"章: {context['section']}")
+            print(f"タイトル: {context['title']}")
+            print(f"ページ: {context['page']}")
+            print(context["content"])
